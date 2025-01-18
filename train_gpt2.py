@@ -1,3 +1,4 @@
+import tiktoken
 import time
 import numpy as np
 import math
@@ -14,7 +15,9 @@ def get_device():
         device = "mps"
     return device
 
-# ----------------------------------------
+# ------------------------------------------------------------------------------
+
+
 class CausalSelefAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -40,15 +43,23 @@ class CausalSelefAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # B, nh, T, hs
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # B, nh, T, hs
         # attention (materialize the large (T, T) matrix)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # B, nh, T , T x B, nh, T, hs -> B, nh, T, hs
+        # normal attention
+        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        #att = F.softmax(att, dim=-1)
+        #y = att @ v # B, nh, T , T x B, nh, T, hs -> B, nh, T, hs
+
+        # flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         # output projection
         y = self.c_proj(y)
         return y
 
+class TanhGELU(nn.Module):
+    def forward(self, x):
+        return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -196,10 +207,15 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # TODO: left off here : 
+        # https://www.youtube.com/watch?v=l8pRSuU81PU&list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ&index=10
+        # timestamp 2:29:54
+        pass
 
 # ---------------------------------------
 # prefix tokens
-import tiktoken
 
 class DataLoaderLite:
     def __init__(self, B, T):
@@ -232,7 +248,6 @@ class DataLoaderLite:
         return x, y
 # ---------------------------------------
 
-#print('didnt crash')
 seed = 1337
 num_return_sequences = 5
 max_length = 30
@@ -251,24 +266,46 @@ if torch.cuda.is_available():
 train_loader = DataLoaderLite(B=4, T=1024)
 torch.set_float32_matmul_precision('high')
 
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device, dtype=torch.float32)
+model = torch.compile(model)
+
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate 
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
 
 # optimize!
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.get_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    #with torch.autocast(device_type=device, dtype=torch.bfloat16):
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
+    torch.cuda.synchronize() # wait for the GPU to finish the work
     t1 = time.time()
     dt = (t1 - t0)*1000
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, time: {dt:.2f}ms {tokens_per_sec:.2f} tokens/sec")
+    print(f"step {step:4d} | loss: {loss.item()} | lr: {lr:.9f} | norm: {norm:.4f} | time: {dt:.2f}ms | {tokens_per_sec:.2f} tokens/sec")
     if device == "mps":
         torch.mps.empty_cache()
 
