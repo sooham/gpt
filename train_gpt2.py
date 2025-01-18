@@ -266,6 +266,16 @@ class DataLoaderLite:
         return x, y
 # ---------------------------------------
 
+import argparse
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train or load a GPT model')
+    parser.add_argument('--load_model', type=str, help='Path to saved model weights')
+    return parser.parse_args()
+
+args = parse_args()
+
 seed = 1337
 num_return_sequences = 5
 max_length = 30
@@ -294,7 +304,16 @@ torch.set_float32_matmul_precision('high')
 
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device, dtype=torch.float32)
-model = torch.compile(model)
+
+if args.load_model:
+    print(f"Loading model weights from {args.load_model}")
+    model.load_state_dict(torch.load(args.load_model))
+    model = torch.compile(model)
+    print("Model loaded successfully")
+    sys.exit()
+else:
+    print("No model weights provided, starting from scratch")
+    model = torch.compile(model)
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -344,7 +363,13 @@ for step in range(max_steps):
     print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.9f} | norm: {norm:.4f} | time: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
     if device == "mps":
         torch.mps.empty_cache()
-    
+
+# Save the model weights after training
+timestamp = time.strftime("%Y%m%dT%H%M%S")
+filename = f'shakespeare_model_{timestamp}.pt'
+torch.save(model.state_dict(), filename)
+print(f"Model weights saved to {filename}")
+
 import sys; sys.exit()
 # prefix tokens
 model.eval()
